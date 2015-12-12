@@ -1,0 +1,222 @@
+
+#include <fstream>
+#include <curl/curl.h>
+#include "utility.h"
+
+using namespace std;
+
+#define defaultChunkSize    1000000
+#define defaultDownloadSize 4000000
+#define defaultChunkNumber  4
+#define kMAXChunkNumber 1000
+
+#define DEBUG
+
+void setup(CURL *hnd, int num, string input_url, int low_range, int high_range, 
+           stringstream  &out) 
+{
+  curl_easy_setopt(hnd, CURLOPT_URL, input_url.c_str());
+  curl_easy_setopt(hnd, CURLOPT_WRITEFUNCTION, write_data);
+  curl_easy_setopt(hnd, CURLOPT_WRITEDATA, &out);
+  string range = "Range: bytes=" + NumberToString( low_range )  + '-' +
+                  NumberToString( high_range );
+#ifdef DEBUG
+  printf(" second .........range ========= %s\n", range.c_str());
+  curl_easy_setopt(hnd, CURLOPT_VERBOSE, 1L);
+#endif
+  curl_slist *list = NULL;
+  list = curl_slist_append(list, range.c_str());
+  curl_easy_setopt(hnd, CURLOPT_HTTPHEADER, list);
+  curl_easy_setopt(hnd, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+}
+
+int writeDataToFile(stringstream data[], int status[], int num_chunks, 
+                    string output_file_name) 
+{
+  ofstream myfile;
+  myfile.open(output_file_name.c_str());
+  for (int i=0; i<num_chunks; i++) {
+#ifdef DEBUG
+    printf("..................status[ %d ] ==  %d\n", i, status[i]); 
+#endif
+    if (status[i] == 206) {
+      myfile << data[i].str();
+    }
+  }
+  myfile.close();
+}
+
+int DownloadSynchronous(string url, int num_chunks, int chunk_size, 
+                        string output_file_name)
+{
+#ifdef DEBUG
+  printf(" num of chunks : %d URL is %s\n", num_chunks, url.c_str());
+#endif
+  CURL *easy[kMAXChunkNumber];
+
+  /*The data for each transfer will be stored in this variable*/
+  stringstream resultData[num_chunks]; 
+
+  int status [num_chunks];
+  int low_range = 0, high_range = 0;
+
+  for (int i = 0; i < num_chunks; i++) {
+    easy[i] = curl_easy_init();
+    high_range = chunk_size * (i+1);
+    setup(easy[i], i, url, low_range, high_range, resultData[i]);
+#ifdef DEBUG
+    printf("i = %d  lowrange= %d  high_range= %d", i, low_range, high_range);
+#endif
+    low_range = high_range;
+    CURLcode res = curl_easy_perform(easy[i]);
+    if (res != CURLE_OK) {
+      fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+    }
+    long http_code = 0;
+    curl_easy_getinfo(easy[i], CURLINFO_RESPONSE_CODE, &http_code);
+  
+#ifdef DEBUG
+    printf("====HTTP     CODE =============  %ld\n", http_code);
+#endif
+    status[i] = http_code;
+    writeDataToFile(resultData, status, num_chunks, output_file_name);
+    curl_easy_cleanup(easy[i]);
+  }
+}
+
+/*
+This function checks different transfers to see how each one went and what are the return code.
+is used to read the status of each transfer in he multi interface.
+First it needs to figure out which transfer a message belong, therefore
+it find the index of transfer in the array of transfers.
+It returns the http response code of each request in status. The status array will
+be used for writing data to the file; i.e., only the result of successful responses
+will be written to the file.
+
+*/
+void check_multi_info(CURL **easyindex, CURLM *multi, int num_chunks, int *status) 
+{
+  CURLMsg *msg;
+  int msgs_left;
+  CURL *easy;
+  CURLcode res;
+  do {
+    msg = curl_multi_info_read(multi, &msgs_left);
+
+    if ( msg && (msg->msg == CURLMSG_DONE) ) {
+      int idx, found = 0;
+
+      // Find out which handle this message is about 
+      for (idx = 0; idx < num_chunks; idx++) {
+        found = (msg->easy_handle == easyindex[idx]);
+        if (found)
+          break;
+      }
+      long http_code = 0;
+      curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &http_code);
+      status[idx] = http_code;
+#ifdef DEBUG
+      printf("=================%p %d  %ld\n", easy, idx, http_code);
+#endif
+    }
+  } while (msg);
+}
+
+/*
+The following function performs the parallel download by using multi_interface
+API of libcurl library. It takes the url, number of chuncks and size chunks as
+input and return the data received from the sever on the output_file_name.
+*/
+int DownloadParallel(string url, int num_chunks, int chunk_size, 
+                     string output_file_name)
+{ 
+#ifdef DEBUG
+  printf(" num of chunks : %d URL is %s\n", num_chunks, url.c_str());
+#endif
+  CURL *easy[kMAXChunkNumber];
+  CURLM *multi_handle;
+
+  stringstream resultData[num_chunks];
+  int status[num_chunks];
+  int low_range = 0, high_range = 0;
+
+  int still_running; /* keep number of running handles */
+  multi_handle = curl_multi_init();
+  for (int i = 0; i < num_chunks; i++) {
+    easy[i] = curl_easy_init();
+    high_range = chunk_size * (i+1);
+    setup(easy[i], i, url, low_range, high_range, resultData[i]);
+#ifdef DEBUG
+    printf("i = %d  lowrange= %d  high_range= %d", i, low_range, high_range);
+#endif
+    low_range = high_range;
+    curl_multi_add_handle(multi_handle, easy[i]);
+  }
+
+    /*
+    Starting the transfer by calling curl_multi_perform which is a non-blocking 
+    function. It performs all transfers asynchronously on all the added handles.
+    */
+    curl_multi_perform(multi_handle, &still_running);
+
+    /*
+    The curl_multi_perfor function needs to be called until all transfers are 
+    completed. This is done inside a loop. After every call, the application 
+    waits for a period of time before calling the function again. The time to
+    wait is found by calling curl_multi_timeout. Whenever a transfer gets 
+    completed, the number of transfers (still_running) reduces by one.
+    */
+    do {
+          CURLMcode res = curl_multi_perform(multi_handle, &still_running);
+    } while(still_running);
+
+     check_multi_info(easy, multi_handle, num_chunks, status);
+
+    /*This function appends the output of each transfer to the final output file*/
+    writeDataToFile(resultData, status, num_chunks, output_file_name);
+
+    curl_multi_cleanup(multi_handle);
+
+    for(int i = 0; i < num_chunks; i++)
+      curl_easy_cleanup(easy[i]);
+  
+  return 0;
+}
+
+int main(int argc, char **argv)
+{
+  string url;
+  int chunk_size = defaultChunkSize;
+  int totalDownloadSize = defaultDownloadSize;
+  int num_chunks = defaultChunkNumber;
+  int parallel = 0;
+  string output_file_name("outputfile");
+
+  readArgs(argc, argv, url, num_chunks, chunk_size, totalDownloadSize, 
+           parallel, output_file_name);
+  
+  if ( (!num_chunks) || (num_chunks > kMAXChunkNumber) ) 
+    num_chunks = defaultChunkNumber;
+
+  if (num_chunks*chunk_size != totalDownloadSize) {
+    chunk_size = totalDownloadSize/num_chunks;
+  }
+#ifdef DEBUG
+  printf("num_chunks = %d chunk_size = %d totalDownloadSize = %d\n", num_chunks, 
+         chunk_size, totalDownloadSize);
+#endif
+
+  if (parallel == 1) {
+#ifdef DEBUG
+    printf("performing PARALLEL download\n");
+ #endif
+    DownloadParallel(url, num_chunks, chunk_size, output_file_name);
+  }  
+  else {
+#ifdef DEBUG
+    printf("performing SYNCHRONOUS download\n");
+#endif
+    DownloadSynchronous(url, num_chunks, chunk_size, output_file_name);
+  }
+  return 0;
+}
