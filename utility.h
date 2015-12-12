@@ -19,6 +19,7 @@ argc and argv and extract the command line options from it.
 int readArgs(int argc, char **argv, string &url, int &chunksnum, int &chunksize,
              int &downloadSize, int &parallel, string &filename);
 
+/* This function is required in libcurl library to write the output of a transfer*/
 size_t write_data(void *ptr, size_t size, size_t nmemb, void *stream);
 
 string NumberToString ( int Number );
